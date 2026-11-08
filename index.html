@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#1b2340">
+<title>Pipit Terbang</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1b2340;
+    overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  #wrap {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    display: block;
+    touch-action: none;
+    border-radius: 10px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, .45);
+  }
+  #mute {
+    position: fixed;
+    top: max(10px, env(safe-area-inset-top));
+    right: max(10px, env(safe-area-inset-right));
+    width: 44px;
+    height: 44px;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, .35);
+    color: #fff;
+    font-size: 22px;
+    cursor: pointer;
+    z-index: 5;
+  }
+  #mute:active { background: rgba(0, 0, 0, .55); }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<button id="mute" aria-label="Nyalakan/matikan suara" title="Suara (M)">🔊</button>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- Pengaturan ----------
+  const W = 400, H = 600, GROUND = 80;
+  const GRAVITY = 1500;      // px/detik^2
+  const FLAP_V = -440;       // kecepatan lompat
+  const SPEED = 150;         // kecepatan rintangan
+  const GAP = 165;           // celah antar pilar
+  const SPACING = 230;       // jarak antar pilar
+  const PIPE_W = 64;
+  const CAP_H = 24;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const muteBtn = document.getElementById('mute');
+
+  // ---------- Ukuran layar responsif ----------
+  let viewScale = 1;
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    viewScale = Math.min(window.innerWidth / W, window.innerHeight / H);
+    const cssW = Math.floor(W * viewScale);
+    const cssH = Math.floor(H * viewScale);
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- Penyimpanan skor ----------
+  let best = 0;
+  try { best = parseInt(localStorage.getItem('pipit-best') || '0', 10) || 0; } catch (e) {}
+  function saveBest() { try { localStorage.setItem('pipit-best', String(best)); } catch (e) {} }
+
+  // ---------- Suara (WebAudio) ----------
+  let audio = null;
+  let muted = false;
+  try { muted = localStorage.getItem('pipit-muted') === '1'; } catch (e) {}
+  muteBtn.textContent = muted ? '🔇' : '🔊';
+
+  function unlockAudio() {
+    if (!audio) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) { try { audio = new AC(); } catch (e) { audio = null; } }
+    }
+    if (audio && audio.state === 'suspended') audio.resume();
+  }
+  function tone(f0, f1, dur, type, vol) {
+    if (muted || !audio) return;
+    const t = audio.currentTime;
+    const o = audio.createOscillator();
+    const g = audio.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(f1, 1), t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(audio.destination);
+    o.start(t); o.stop(t + dur + 0.02);
+  }
+  const sfx = {
+    flap:  () => tone(420, 760, 0.12, 'square', 0.06),
+    score: () => { tone(880, 880, 0.08, 'triangle', 0.12); setTimeout(() => tone(1320, 1320, 0.14, 'triangle', 0.12), 70); },
+    hit:   () => tone(260, 50, 0.35, 'sawtooth', 0.14),
+  };
+  function toggleMute() {
+    muted = !muted;
+    muteBtn.textContent = muted ? '🔇' : '🔊';
+    try { localStorage.setItem('pipit-muted', muted ? '1' : '0'); } catch (e) {}
+  }
+  muteBtn.addEventListener('click', () => { unlockAudio(); toggleMute(); muteBtn.blur(); });
+
+  // ---------- State game ----------
+  let state = 'ready';            // ready | playing | dead
+  let time = 0, deadAt = 0;
+  let score = 0, newBest = false;
+  let groundX = 0, shake = 0, flash = 0;
+  let pipes = [];
+  const bird = { x: 110, y: H / 2 - 30, vy: 0, r: 15, rot: 0 };
+
+  const clouds = Array.from({ length: 6 }, (_, i) => ({
+    x: Math.random() * W,
+    y: 40 + Math.random() * 220,
+    s: 0.6 + Math.random() * 0.9,
+    v: 8 + Math.random() * 14,
+  }));
+
+  function reset() {
+    state = 'ready';
+    score = 0;
+    newBest = false;
+    pipes = [];
+    bird.y = H / 2 - 30;
+    bird.vy = 0;
+    bird.rot = 0;
+    flash = 0;
+  }
+
+  function spawnPipe(x) {
+    const minTop = 70;
+    const maxTop = H - GROUND - GAP - 70;
+    pipes.push({ x, top: minTop + Math.random() * (maxTop - minTop), passed: false });
+  }
+
+  function flap() {
+    bird.vy = FLAP_V;
+    sfx.flap();
+  }
+
+  function die() {
+    if (state === 'dead') return;
+    state = 'dead';
+    deadAt = time;
+    shake = 0.25;
+    flash = 0.2;
+    sfx.hit();
+    if (score > best) { best = score; newBest = true; saveBest(); }
+  }
+
+  // ---------- Input ----------
+  function action() {
+    unlockAudio();
+    if (state === 'ready') {
+      state = 'playing';
+      spawnPipe(W + 120);
+      flap();
+    } else if (state === 'playing') {
+      flap();
+    } else if (state === 'dead' && time - deadAt > 0.5) {
+      reset();
+    }
+  }
+  canvas.addEventListener('pointerdown', (e) => { e.preventDefault(); action(); });
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+      e.preventDefault();
+      if (!e.repeat) action();
+    } else if (e.code === 'KeyM') {
+      toggleMute();
+    }
+  });
+  window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  // ---------- Tabrakan ----------
+  function circleHitsRect(cx, cy, r, rx, ry, rw, rh) {
+    const nx = Math.max(rx, Math.min(cx, rx + rw));
+    const ny = Math.max(ry, Math.min(cy, ry + rh));
+    const dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy < r * r;
+  }
+  function hitsPipe(p) {
+    const r = bird.r - 3; // sedikit memaafkan
+    const bottomY = p.top + GAP;
+    return (
+      circleHitsRect(bird.x, bird.y, r, p.x, 0, PIPE_W, p.top - CAP_H) ||
+      circleHitsRect(bird.x, bird.y, r, p.x - 4, p.top - CAP_H, PIPE_W + 8, CAP_H) ||
+      circleHitsRect(bird.x, bird.y, r, p.x - 4, bottomY, PIPE_W + 8, CAP_H) ||
+      circleHitsRect(bird.x, bird.y, r, p.x, bottomY + CAP_H, PIPE_W, H)
+    );
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    time += dt;
+    if (shake > 0) shake = Math.max(0, shake - dt);
+    if (flash > 0) flash = Math.max(0, flash - dt);
+
+    for (const c of clouds) {
+      c.x -= c.v * dt;
+      if (c.x < -90) { c.x = W + 60; c.y = 40 + Math.random() * 220; }
+    }
+
+    if (state !== 'dead') groundX = (groundX + SPEED * dt) % 24;
+
+    if (state === 'ready') {
+      bird.y = H / 2 - 30 + Math.sin(time * 4) * 8;
+      bird.rot = 0;
+      return;
+    }
+
+    // burung
+    bird.vy += GRAVITY * dt;
+    bird.y += bird.vy * dt;
+    const targetRot = Math.max(-0.45, Math.min(1.35, bird.vy / 520));
+    bird.rot += (targetRot - bird.rot) * Math.min(1, dt * 12);
+
+    const floorY = H - GROUND - bird.r;
+    if (bird.y >= floorY) {
+      bird.y = floorY;
+      bird.vy = 0;
+      if (state === 'playing') die();
+    }
+
+    if (state === 'dead') return;
+
+    if (bird.y < bird.r) { bird.y = bird.r; if (bird.vy < 0) bird.vy = 0; }
+
+    // pilar
+    for (const p of pipes) p.x -= SPEED * dt;
+    const last = pipes[pipes.length - 1];
+    if (!last || last.x < W - SPACING + 20) spawnPipe(Math.max(W + 40, (last ? last.x : 0) + SPACING));
+    pipes = pipes.filter((p) => p.x > -PIPE_W - 20);
+
+    for (const p of pipes) {
+      if (!p.passed && p.x + PIPE_W < bird.x - bird.r) {
+        p.passed = true;
+        score++;
+        sfx.score();
+      }
+      if (hitsPipe(p)) { die(); break; }
+    }
+  }
+
+  // ---------- Gambar ----------
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function text(str, x, y, size, align, fill) {
+    ctx.font = `800 ${size}px system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif`;
+    ctx.textAlign = align || 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(3, size / 6);
+    ctx.strokeStyle = 'rgba(20, 20, 50, .85)';
+    ctx.strokeText(str, x, y);
+    ctx.fillStyle = fill || '#fff';
+    ctx.fillText(str, x, y);
+  }
+
+  function drawBackground() {
+    const sky = ctx.createLinearGradient(0, 0, 0, H - GROUND);
+    sky.addColorStop(0, '#5ec8f2');
+    sky.addColorStop(1, '#d9f4ff');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, H);
+
+    // matahari
+    ctx.fillStyle = 'rgba(255, 244, 180, .9)';
+    ctx.beginPath(); ctx.arc(320, 90, 34, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255, 244, 180, .25)';
+    ctx.beginPath(); ctx.arc(320, 90, 52, 0, Math.PI * 2); ctx.fill();
+
+    // awan
+    ctx.fillStyle = 'rgba(255, 255, 255, .85)';
+    for (const c of clouds) {
+      const s = c.s;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, 18 * s, 0, Math.PI * 2);
+      ctx.arc(c.x + 20 * s, c.y - 8 * s, 22 * s, 0, Math.PI * 2);
+      ctx.arc(c.x + 44 * s, c.y, 17 * s, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // bukit jauh
+    ctx.fillStyle = '#9fd9a6';
+    ctx.beginPath();
+    ctx.moveTo(0, H - GROUND);
+    for (let x = 0; x <= W; x += 10) {
+      ctx.lineTo(x, H - GROUND - 40 - Math.sin(x * 0.018 + 1) * 22 - Math.sin(x * 0.045) * 8);
+    }
+    ctx.lineTo(W, H - GROUND);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawPipe(p) {
+    const bottomY = p.top + GAP;
+    const body = ctx.createLinearGradient(p.x, 0, p.x + PIPE_W, 0);
+    body.addColorStop(0, '#5b3fa0');
+    body.addColorStop(0.4, '#8a67e0');
+    body.addColorStop(1, '#4a3185');
+
+    const cap = ctx.createLinearGradient(p.x - 4, 0, p.x + PIPE_W + 4, 0);
+    cap.addColorStop(0, '#6b4bc0');
+    cap.addColorStop(0.4, '#a98bff');
+    cap.addColorStop(1, '#553b9a');
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#2a1b57';
+
+    // pilar atas
+    ctx.fillStyle = body;
+    ctx.fillRect(p.x, -5, PIPE_W, p.top - CAP_H + 5);
+    ctx.strokeRect(p.x, -5, PIPE_W, p.top - CAP_H + 5);
+    ctx.fillStyle = cap;
+    roundRect(p.x - 4, p.top - CAP_H, PIPE_W + 8, CAP_H, 5);
+    ctx.fill(); ctx.stroke();
+
+    // pilar bawah
+    ctx.fillStyle = body;
+    ctx.fillRect(p.x, bottomY + CAP_H, PIPE_W, H);
+    ctx.strokeRect(p.x, bottomY + CAP_H, PIPE_W, H);
+    ctx.fillStyle = cap;
+    roundRect(p.x - 4, bottomY, PIPE_W + 8, CAP_H, 5);
+    ctx.fill(); ctx.stroke();
+
+    // kilau kristal
+    ctx.fillStyle = 'rgba(255, 255, 255, .22)';
+    ctx.fillRect(p.x + 10, 0, 6, p.top - CAP_H - 6);
+    ctx.fillRect(p.x + 10, bottomY + CAP_H + 6, 6, H);
+  }
+
+  function drawGround() {
+    const gy = H - GROUND;
+    ctx.fillStyle = '#d9b46a';
+    ctx.fillRect(0, gy, W, GROUND);
+    ctx.fillStyle = '#c29a4c';
+    for (let x = -24 - groundX; x < W + 24; x += 24) {
+      ctx.beginPath();
+      ctx.moveTo(x, gy + 18);
+      ctx.lineTo(x + 12, gy + 18);
+      ctx.lineTo(x + 24, gy + GROUND);
+      ctx.lineTo(x + 12, gy + GROUND);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.fillStyle = '#6cc04a';
+    ctx.fillRect(0, gy, W, 16);
+    ctx.fillStyle = '#4ea133';
+    ctx.fillRect(0, gy + 12, W, 4);
+    ctx.strokeStyle = '#2f5d1f';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
+  }
+
+  function drawBird() {
+    ctx.save();
+    ctx.translate(bird.x, bird.y);
+    ctx.rotate(bird.rot);
+
+    // ekor
+    ctx.fillStyle = '#e6892b';
+    ctx.beginPath();
+    ctx.moveTo(-12, 2); ctx.lineTo(-24, -4); ctx.lineTo(-22, 8); ctx.closePath();
+    ctx.fill();
+
+    // badan
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#7a4310';
+    ctx.fillStyle = '#ffc93c';
+    ctx.beginPath(); ctx.ellipse(0, 0, 18, 15, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+    // perut
+    ctx.fillStyle = '#fff1b8';
+    ctx.beginPath(); ctx.ellipse(2, 6, 10, 7, 0, 0, Math.PI * 2); ctx.fill();
+
+    // sayap (mengepak)
+    const flapPhase = state === 'dead' ? 0.5 : Math.sin(time * 20);
+    ctx.save();
+    ctx.translate(-5, 3);
+    ctx.rotate(flapPhase * 0.6 - 0.2);
+    ctx.fillStyle = '#ff9f2e';
+    ctx.strokeStyle = '#7a4310';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.ellipse(-2, 0, 10, 6, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.restore();
+
+    // mata
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(8, -5, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#7a4310'; ctx.stroke();
+    ctx.fillStyle = '#222';
+    if (state === 'dead') {
+      ctx.strokeStyle = '#222'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(5, -8); ctx.lineTo(11, -2);
+      ctx.moveTo(11, -8); ctx.lineTo(5, -2);
+      ctx.stroke();
+    } else {
+      ctx.beginPath(); ctx.arc(10, -5, 2.6, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // paruh
+    ctx.fillStyle = '#ff6a3d';
+    ctx.strokeStyle = '#7a4310';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(14, 0); ctx.lineTo(27, 3); ctx.lineTo(14, 8); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawHud() {
+    if (state === 'playing') {
+      text(String(score), W / 2, 70, 56);
+    }
+
+    if (state === 'ready') {
+      text('PIPIT TERBANG', W / 2, 150, 38);
+      ctx.save();
+      ctx.globalAlpha = 0.75 + Math.sin(time * 5) * 0.25;
+      text('Ketuk layar atau tekan SPASI', W / 2, 400, 20);
+      text('untuk terbang!', W / 2, 428, 20);
+      ctx.restore();
+      if (best > 0) text('Terbaik: ' + best, W / 2, 470, 18, 'center', '#ffe48a');
+    }
+
+    if (state === 'dead') {
+      const px = 50, py = 150, pw = W - 100, ph = 250;
+      ctx.fillStyle = 'rgba(0, 0, 0, .25)';
+      roundRect(px + 4, py + 6, pw, ph, 18); ctx.fill();
+      ctx.fillStyle = '#fff4d6';
+      roundRect(px, py, pw, ph, 18); ctx.fill();
+      ctx.lineWidth = 4; ctx.strokeStyle = '#7a4310'; ctx.stroke();
+
+      text('GAME OVER', W / 2, py + 40, 34, 'center', '#ff6a3d');
+      ctx.fillStyle = '#7a4310';
+      ctx.font = '700 18px system-ui, Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('SKOR', W / 2 - 55, py + 90);
+      ctx.fillText('TERBAIK', W / 2 + 55, py + 90);
+      text(String(score), W / 2 - 55, py + 130, 40);
+      text(String(best), W / 2 + 55, py + 130, 40, 'center', '#ffe48a');
+
+      if (newBest && score > 0) text('REKOR BARU!', W / 2, py + 175, 20, 'center', '#7CFF8A');
+
+      if (time - deadAt > 0.5) {
+        ctx.save();
+        ctx.globalAlpha = 0.6 + Math.sin(time * 6) * 0.4;
+        ctx.fillStyle = '#7a4310';
+        ctx.font = '800 17px system-ui, Arial, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Ketuk / SPASI untuk main lagi', W / 2, py + 220);
+        ctx.restore();
+      }
+    }
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) {
+      const m = shake * 40;
+      ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+    }
+    drawBackground();
+    for (const p of pipes) drawPipe(p);
+    drawGround();
+    drawBird();
+    ctx.restore();
+
+    if (flash > 0) {
+      ctx.fillStyle = `rgba(255, 255, 255, ${flash / 0.2 * 0.7})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+    drawHud();
+  }
+
+  // ---------- Loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 1 / 30);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
